@@ -81,25 +81,60 @@ function persistPromptLibrary(list) {
 // Saved projects: a name + full nodes/edges snapshot, keyed by id. The
 // currently open one is auto-saved on every change so a page refresh never
 // loses work; "Save as" / "Import" create additional named entries.
-const PROJECTS_KEY = "image-flow-studio:projects";
+//
+// Projects carry their images as data URLs, which outgrow localStorage's
+// ~5 MB after a handful of images, so each project is one IndexedDB record.
+// Writing one record at a time (never the whole map) means a save that
+// happens before loading finishes can't wipe the other projects.
+const LEGACY_PROJECTS_KEY = "image-flow-studio:projects";
 const CURRENT_PROJECT_KEY = "image-flow-studio:currentProjectId";
+const PROJECTS_STORE = "projects";
+let projectsDb = null;
 
-function loadProjects() {
+function openProjectsDb() {
+  projectsDb ||= new Promise((resolve, reject) => {
+    const req = indexedDB.open("image-flow-studio", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(PROJECTS_STORE, { keyPath: "id" });
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return projectsDb;
+}
+
+async function projectsTx(mode, fn) {
+  const db = await openProjectsDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PROJECTS_STORE, mode);
+    const req = fn(tx.objectStore(PROJECTS_STORE));
+    tx.oncomplete = () => resolve(req?.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function saveProjectRecord(entry) {
+  projectsTx("readwrite", (s) => s.put(entry)).catch((err) => console.warn("프로젝트 저장 실패", err));
+}
+
+function deleteProjectRecord(id) {
+  projectsTx("readwrite", (s) => s.delete(id)).catch((err) => console.warn("프로젝트 삭제 실패", err));
+}
+
+// Reads every saved project, first moving any left in localStorage by
+// older versions into IndexedDB.
+async function loadSavedProjects() {
+  let legacy = {};
   try {
-    const raw = localStorage.getItem(PROJECTS_KEY);
-    if (raw) return JSON.parse(raw);
+    legacy = JSON.parse(localStorage.getItem(LEGACY_PROJECTS_KEY) || "{}");
   } catch {
     // ignore
   }
-  return {};
-}
-
-function persistProjects(projects) {
-  try {
-    localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
-  } catch {
-    // storage full or disabled — saved projects just won't survive a refresh
+  const moving = Object.values(legacy);
+  if (moving.length) {
+    await projectsTx("readwrite", (s) => moving.forEach((p) => s.put(p)));
+    localStorage.removeItem(LEGACY_PROJECTS_KEY);
   }
+  const list = await projectsTx("readonly", (s) => s.getAll());
+  return Object.fromEntries((list || []).map((p) => [p.id, p]));
 }
 
 function loadCurrentProjectId() {
@@ -175,21 +210,17 @@ function syncInputs(nodes, edges, previousEdges = edges) {
 
 const hotState = import.meta.hot ? window.__imageFlowStore?.getState() : null;
 
-// With no hot-reload state (i.e. a real page load), restore whatever project
-// was open last so refreshing the browser doesn't wipe the canvas.
-const initialProjects = loadProjects();
-const initialProjectId = loadCurrentProjectId();
-const restoredProject = !hotState && initialProjectId ? initialProjects[initialProjectId] : null;
-
+// Saved projects load asynchronously from IndexedDB right after the store is
+// created (see hydrateProjects at the bottom of this file).
 export const useStore = create((set, get) => ({
   settings: loadSettings(),
-  nodes: hotState?.nodes || restoredProject?.nodes || [],
+  nodes: hotState?.nodes || [],
   edges: hotState
     ? (hotState.generationLinksVersion === 1 ? hotState.edges : addGenerationLinks(hotState.nodes || [], hotState.edges || []))
-    : restoredProject?.edges || [],
+    : [],
   generationLinksVersion: 1,
-  projects: initialProjects,
-  currentProjectId: restoredProject ? initialProjectId : null,
+  projects: hotState?.projects || {},
+  currentProjectId: hotState?.currentProjectId || null,
   lightboxImage: null,
 
   openLightbox: (image) => set({ lightboxImage: image }),
@@ -364,7 +395,7 @@ export const useStore = create((set, get) => ({
     const { projects } = get();
     if (!projects[id] || !name) return;
     const next = { ...projects, [id]: { ...projects[id], name } };
-    persistProjects(next);
+    saveProjectRecord(next[id]);
     set({ projects: next });
   },
 
@@ -374,7 +405,7 @@ export const useStore = create((set, get) => ({
     const { nodes, edges, projects } = get();
     const id = nextId('project');
     const next = { ...projects, [id]: { id, name: name || '제목 없음', savedAt: Date.now(), nodes, edges } };
-    persistProjects(next);
+    saveProjectRecord(next[id]);
     persistCurrentProjectId(id);
     set({ projects: next, currentProjectId: id });
     return id;
@@ -390,7 +421,7 @@ export const useStore = create((set, get) => ({
   deleteProject: (id) => {
     const projects = { ...get().projects };
     delete projects[id];
-    persistProjects(projects);
+    deleteProjectRecord(id);
     if (get().currentProjectId === id) {
       persistCurrentProjectId(null);
       set({ projects, currentProjectId: null });
@@ -417,7 +448,7 @@ export const useStore = create((set, get) => ({
     const entry = { id, name: parsed?.name || 'Imported', savedAt: Date.now(),
       nodes: parsed?.nodes || [], edges: parsed?.edges || [] };
     const next = { ...get().projects, [id]: entry };
-    persistProjects(next);
+    saveProjectRecord(entry);
     persistCurrentProjectId(id);
     set({ projects: next, nodes: entry.nodes, edges: entry.edges, currentProjectId: id });
   },
@@ -440,8 +471,31 @@ useStore.subscribe((state) => {
     const id = currentProjectId && projects[currentProjectId] ? currentProjectId : nextId('project');
     const name = projects[id]?.name || '제목 없음';
     const next = { ...projects, [id]: { id, name, savedAt: Date.now(), nodes, edges } };
-    persistProjects(next);
+    saveProjectRecord(next[id]);
     persistCurrentProjectId(id);
     useStore.setState({ projects: next, currentProjectId: id });
   }, 800);
 });
+
+// On a real page load (no hot-reload state), load the saved projects and
+// reopen whichever one was open last so a refresh doesn't wipe the canvas.
+async function hydrateProjects() {
+  try {
+    const saved = await loadSavedProjects();
+    const state = useStore.getState();
+    const patch = { projects: { ...saved, ...state.projects } };
+    const lastId = loadCurrentProjectId();
+    const last = saved[lastId];
+    if (!hotState && last && !state.nodes.length && !state.currentProjectId) {
+      // Marks the restored canvas as already saved so autosave doesn't
+      // immediately rewrite the record it was just read from.
+      lastAutosavedNodes = last.nodes;
+      lastAutosavedEdges = last.edges;
+      Object.assign(patch, { nodes: last.nodes, edges: last.edges, currentProjectId: lastId });
+    }
+    useStore.setState(patch);
+  } catch (err) {
+    console.warn("저장된 프로젝트를 불러오지 못했습니다", err);
+  }
+}
+if (!hotState) hydrateProjects();
