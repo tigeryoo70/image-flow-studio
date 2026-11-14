@@ -212,7 +212,7 @@ app.post("/api/generate", async (req, res) => {
 // CORS issues calling api.vworld.kr directly, and the key stays server-side.
 app.get("/api/vworld/search", async (req, res) => {
   const apiKey = process.env.VWORLD_API_KEY;
-  if (!apiKey) return res.status(400).json({ error: "VWORLD_API_KEY is not set in server/.env" });
+  if (!apiKey) return res.status(400).json({ error: "VWORLD_API_KEY is not set (server/.env locally, Vercel env vars when deployed)" });
 
   const query = req.query.query;
   if (!query) return res.status(400).json({ error: "Missing query" });
@@ -243,5 +243,11 @@ app.get("/api/vworld/search", async (req, res) => {
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`[server] listening on http://localhost:${PORT}`));
+// On Vercel the app is imported by api/index.js and served as a function;
+// locally (npm run dev) it listens on its own port as before.
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => console.log(`[server] listening on http://localhost:${PORT}`));
+}
+
+export default app;
