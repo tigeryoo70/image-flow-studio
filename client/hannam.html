@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>한남동 722-10 3D</title>
+    <!--
+      VWorld SDK must be a static tag (it uses document.write internally).
+      Vite replaces %VWORLD_API_KEY% from server/.env at serve time, so open
+      this page through the dev server: http://localhost:5173/hannam.html
+    -->
+    <script type="text/javascript" src="https://map.vworld.kr/js/webglMapInit.js.do?version=3.0&apiKey=%VWORLD_API_KEY%"></script>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: rgba(20, 23, 30, 0.88);
+        --border: rgba(255, 255, 255, 0.1);
+        --text: #e8eaf0;
+        --muted: #9aa1b2;
+        --accent: #4ade80;
+        --pin: #ff4d4f;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+        font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; }
+      #vworld-map { position: fixed; inset: 0; }
+      .panel {
+        position: fixed; top: 16px; left: 16px; width: min(320px, calc(100vw - 32px));
+        background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+        padding: 16px; backdrop-filter: blur(8px); z-index: 10;
+      }
+      .panel h1 { margin: 0 0 4px; font-size: 18px; }
+      .panel .sub { margin: 0 0 12px; font-size: 12px; color: var(--muted); }
+      .row { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0;
+        border-top: 1px solid var(--border); }
+      .row span:first-child { color: var(--muted); }
+      .row span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+      .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+      button {
+        background: rgba(255, 255, 255, 0.06); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 8px; font-size: 12px; cursor: pointer; font-family: inherit;
+      }
+      button:hover { background: rgba(255, 255, 255, 0.12); }
+      button.on { border-color: var(--accent); color: var(--accent); }
+      .status { margin-top: 10px; font-size: 11px; color: var(--muted); min-height: 14px; }
+      .status.err { color: #f87171; }
+    </style>
+  </head>
+  <body>
+    <div id="vworld-map"></div>
+
+    <div class="panel">
+      <h1>한남동 722-10</h1>
+      <p class="sub">서울특별시 용산구 한남동 722-10 · VWorld 3D</p>
+      <div class="row"><span>도로명</span><span id="road">—</span></div>
+      <div class="row"><span>위도 / 경도</span><span id="coord">—</span></div>
+      <div class="row"><span>필지 면적</span><span id="area">—</span></div>
+      <div class="btns">
+        <button id="btn-focus">위치로 이동</button>
+        <button id="btn-orbit">360° 회전</button>
+        <button id="btn-top">위에서 보기</button>
+        <button id="btn-bldg" class="on">3D 건물</button>
+        <button id="btn-lot" class="on">필지 경계</button>
+        <button id="btn-shot">화면 저장</button>
+      </div>
+      <div class="status" id="status">지도를 불러오는 중…</div>
+    </div>
+
+    <script>
+    (() => {
+      const ADDRESS = "서울특별시 용산구 한남동 722-10";
+      const KEY = "%VWORLD_API_KEY%";
+      // Approximate fallback in case the geocoder is unreachable.
+      let target = { lon: 127.0028, lat: 37.5404 };
+
+      const el = (id) => document.getElementById(id);
+      const setStatus = (msg, err) => {
+        el("status").textContent = msg;
+        el("status").className = "status" + (err ? " err" : "");
+      };
+
+      // VWorld REST APIs support JSONP, so no server proxy is needed.
+      function jsonp(url, params) {
+        return new Promise((resolve, reject) => {
+          const cb = "__vw_cb_" + Math.random().toString(36).slice(2);
+          const qs = new URLSearchParams({ ...params, key: KEY, domain: location.origin, format: "json", callback: cb });
+          const s = document.createElement("script");
+          const timer = setTimeout(() => { cleanup(); reject(new Error("timeout")); }, 10000);
+          function cleanup() { clearTimeout(timer); delete window[cb]; s.remove(); }
+          window[cb] = (data) => { cleanup(); resolve(data); };
+          s.onerror = () => { cleanup(); reject(new Error("network")); };
+          s.src = url + "?" + qs.toString();
+          document.head.appendChild(s);
+        });
+      }
+
+      async function geocode() {
+        const data = await jsonp("https://api.vworld.kr/req/address", {
+          service: "address", request: "getcoord", version: "2.0", crs: "epsg:4326",
+          address: ADDRESS, refine: "true", simple: "false", type: "parcel",
+        });
+        const r = data?.response;
+        if (r?.status !== "OK") throw new Error(r?.error?.text || r?.status || "geocode failed");
+        return { lon: Number(r.result.point.x), lat: Number(r.result.point.y) };
+      }
+
+      async function reverseRoad(lon, lat) {
+        const data = await jsonp("https://api.vworld.kr/req/address", {
+          service: "address", request: "getAddress", version: "2.0", crs: "epsg:4326",
+          point: lon + "," + lat, type: "road",
+        });
+        return data?.response?.result?.[0]?.text || null;
+      }
+
+      // Cadastral lot polygon (연속지적도) that contains the point.
+      async function fetchLot(lon, lat) {
+        const data = await jsonp("https://api.vworld.kr/req/data", {
+          service: "data", request: "GetFeature", data: "LP_PA_CBND_BUBUN", version: "2.0",
+          crs: "EPSG:4326", geomFilter: `POINT(${lon} ${lat})`, size: "1",
+          geometry: "true", attribute: "true",
+        });
+        const f = data?.response?.result?.featureCollection?.features?.[0];
+        if (!f) throw new Error("no lot");
+        return f;
+      }
+
+      function waitFor(test, ms = 20000) {
+        return new Promise((resolve, reject) => {
+          const t0 = Date.now();
+          (function poll() {
+            if (window.vworldIsValid === "false") return reject(new Error(window.vworldErrMsg || "VWorld가 API 키를 거부했습니다."));
+            const v = test();
+            if (v) return resolve(v);
+            if (Date.now() - t0 > ms) return reject(new Error("VWorld SDK 로딩 시간 초과 — server/.env의 VWORLD_API_KEY와 localhost 도메인 등록을 확인하세요."));
+            setTimeout(poll, 150);
+          })();
+        });
+      }
+
+      let viewer, Cesium, map, lotEntity, pinEntity, orbiting = false, orbitHeading = 0;
+
+      // Ellipsoid height of the ground at the lot (Seoul terrain sits ~40-70 m above the ellipsoid).
+      function groundZ() {
+        const h = viewer.scene.globe.getHeight(Cesium.Cartographic.fromDegrees(target.lon, target.lat));
+        return Number.isFinite(h) ? h : 50;
+      }
+
+      function flyToTarget(opts = {}) {
+        const center = Cesium.Cartesian3.fromDegrees(target.lon, target.lat, groundZ() + 15);
+        viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(center, 40), {
+          offset: new Cesium.HeadingPitchRange(
+            Cesium.Math.toRadians(opts.heading ?? 20),
+            Cesium.Math.toRadians(opts.pitch ?? -35),
+            opts.range ?? 450
+          ),
+          duration: opts.duration ?? 2,
+        });
+      }
+
+      function addPin() {
+        pinEntity = viewer.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(target.lon, target.lat, 90),
+          point: { pixelSize: 12, color: Cesium.Color.fromCssColorString("#ff4d4f"),
+            outlineColor: Cesium.Color.WHITE, outlineWidth: 2,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY },
+          label: { text: "한남동 722-10", font: "bold 14px sans-serif",
+            fillColor: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
+            style: Cesium.LabelStyle.FILL_AND_OUTLINE, pixelOffset: new Cesium.Cartesian2(0, -22),
+            disableDepthTestDistance: Number.POSITIVE_INFINITY },
+          polyline: { positions: Cesium.Cartesian3.fromDegreesArrayHeights([target.lon, target.lat, 0, target.lon, target.lat, 90]),
+            width: 2, material: Cesium.Color.fromCssColorString("#ff4d4f") },
+        });
+      }
+
+      function addLot(feature) {
+        let rings = feature.geometry.coordinates;
+        if (feature.geometry.type === "MultiPolygon") rings = rings[0];
+        const outer = rings[0];
+        const flat = outer.flat();
+        lotEntity = viewer.entities.add({
+          polygon: {
+            hierarchy: Cesium.Cartesian3.fromDegreesArray(flat),
+            material: Cesium.Color.fromCssColorString("#ff4d4f").withAlpha(0.35),
+            classificationType: Cesium.ClassificationType.BOTH,
+          },
+          polyline: {
+            positions: Cesium.Cartesian3.fromDegreesArray(flat),
+            width: 3, clampToGround: true,
+            material: Cesium.Color.fromCssColorString("#ff4d4f"),
+          },
+        });
+        // Planar area of the lot ring (approximate, in m²).
+        const R = 6378137, lat0 = (target.lat * Math.PI) / 180;
+        const pts = outer.map(([x, y]) => [((x * Math.PI) / 180) * R * Math.cos(lat0), ((y * Math.PI) / 180) * R]);
+        let a = 0;
+        for (let i = 0; i < pts.length - 1; i++) a += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1];
+        el("area").textContent = `약 ${Math.round(Math.abs(a) / 2).toLocaleString()} m²`;
+      }
+
+      function setLayers(names, show) {
+        for (const n of names) {
+          try { const l = map.getLayerElement(n); if (l) show ? l.show() : l.hide(); } catch {}
+        }
+        viewer.scene.requestRender();
+      }
+
+      function startOrbit() {
+        orbiting = true;
+        el("btn-orbit").classList.add("on");
+        orbitHeading = viewer.camera.heading;
+      }
+      function stopOrbit() {
+        orbiting = false;
+        el("btn-orbit").classList.remove("on");
+        viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+      }
+
+      async function main() {
+        if (KEY.startsWith("%") || !KEY) {
+          setStatus("VWORLD_API_KEY가 없습니다. server/.env에 키를 넣고 npm run dev를 재시작하세요.", true);
+          return;
+        }
+
+        try {
+          target = await geocode();
+        } catch (e) {
+          console.warn("geocode failed, using fallback", e);
+        }
+        el("coord").textContent = `${target.lat.toFixed(6)}, ${target.lon.toFixed(6)}`;
+        reverseRoad(target.lon, target.lat).then((t) => { if (t) el("road").textContent = t.replace("서울특별시 ", ""); }).catch(() => {});
+
+        const vw = await waitFor(() => window.vw && window.Cesium && window.vw);
+        // The SDK resets the camera to initPosition once loaded, so make the
+        // initial position itself an oblique view: 450 m away at -35°,
+        // looking toward heading 20° (camera sits SSW of the lot).
+        const range = 450, pitch = 35, heading = 20;
+        const horiz = range * Math.cos((pitch * Math.PI) / 180);
+        const back = ((heading + 180) * Math.PI) / 180;
+        const camLat = target.lat + (horiz * Math.cos(back)) / 111320;
+        const camLon = target.lon + (horiz * Math.sin(back)) / (111320 * Math.cos((target.lat * Math.PI) / 180));
+        const camAlt = 20 + range * Math.sin((pitch * Math.PI) / 180);
+        map = new vw.Map();
+        map.setOption({
+          mapId: "vworld-map",
+          initPosition: new vw.CameraPosition(new vw.CoordZ(camLon, camLat, camAlt), new vw.Direction(heading, -pitch, 0)),
+          logo: false,
+          navigation: false,
+        });
+        map.start();
+
+        viewer = await waitFor(() => window.ws3d?.viewer);
+        Cesium = window.Cesium;
+
+        addPin();
+        fetchLot(target.lon, target.lat)
+          .then(addLot)
+          .catch(() => { el("area").textContent = "조회 실패"; });
+
+        viewer.scene.preRender.addEventListener(() => {
+          if (!orbiting) return;
+          orbitHeading += 0.003;
+          viewer.camera.lookAt(
+            Cesium.Cartesian3.fromDegrees(target.lon, target.lat, groundZ() + 15),
+            new Cesium.HeadingPitchRange(orbitHeading, Cesium.Math.toRadians(-30), 450)
+          );
+          viewer.scene.requestRender();
+        });
+
+        // Once the SDK has applied initPosition, frame the lot properly.
+        (function settle(n = 0) {
+          if (Math.abs(Cesium.Math.toDegrees(viewer.camera.pitch) + 35) < 1 || n > 40) flyToTarget({ duration: 1.5 });
+          else setTimeout(() => settle(n + 1), 250);
+        })();
+        setStatus("드래그: 이동 · 우클릭/휠: 회전·줌");
+
+        el("btn-focus").onclick = () => { stopOrbit(); flyToTarget(); };
+        el("btn-top").onclick = () => { stopOrbit(); flyToTarget({ heading: 0, pitch: -89.9, range: 350 }); };
+        el("btn-orbit").onclick = () => (orbiting ? stopOrbit() : startOrbit());
+        el("btn-bldg").onclick = (e) => {
+          const on = e.currentTarget.classList.toggle("on");
+          setLayers(["facility_build"], on);
+        };
+        el("btn-lot").onclick = (e) => {
+          const on = e.currentTarget.classList.toggle("on");
+          if (lotEntity) lotEntity.show = on;
+          viewer.scene.requestRender();
+        };
+        el("btn-shot").onclick = () => {
+          viewer.render();
+          const a = document.createElement("a");
+          a.download = "hannam-722-10.png";
+          a.href = viewer.scene.canvas.toDataURL("image/png");
+          a.click();
+        };
+      }
+
+      main().catch((e) => setStatus(e.message, true));
+    })();
+    </script>
+  </body>
+</html>
