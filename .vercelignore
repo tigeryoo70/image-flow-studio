@@ -1,0 +1,13 @@
+# Never upload local secrets; keys come from Vercel environment variables.
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+node_modules
+**/node_modules
+**/dist
+.claude
+class
+tests
+education-30hours-image-flow-studio.html
